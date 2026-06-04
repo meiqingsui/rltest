@@ -155,8 +155,11 @@ def _add_test_args(parser):
     group = parser.add_argument_group("Logp Test")
     group.add_argument("--hf-checkpoint", type=str, required=True)
     group.add_argument("--megatron-to-hf-mode", type=str, default="bridge")
-    group.add_argument("--test-tokens", type=str, default="10,11,12,13,14,15,16,17", 
+    group.add_argument("--test-tokens", type=str, default="10,11,12,13,14,15,16,17",
                        help="Comma separated list of token ids for input")
+    group.add_argument("--response-length", type=int, default=None,
+                       help="Length of response tokens (last N tokens). "
+                            "If not set, all tokens except the first are treated as response.")
     return parser
 
 
@@ -320,27 +323,62 @@ def load_hf_weights(model, args: Namespace, bridge) -> None:
 # 5. Forward Step & Logp Extraction
 # ---------------------------------------------------------------------------
 
-def extract_logp_loss_function(target_tokens):
+def extract_logp_loss_function(args, target_tokens):
+    """Compute response-only logp, matching relax/backends/megatron/loss.py::get_responses()."""
+    response_length = getattr(args, "response_length", None)
+    if response_length is None or response_length <= 0:
+        # Default: treat all tokens except the first as response (same as typical LM training)
+        prompt_length = 1
+        response_length = len(target_tokens) - 1
+    else:
+        prompt_length = len(target_tokens) - response_length
+
     def loss_function(output_tensor, non_loss_data=False):
         if non_loss_data:
             return output_tensor, {}
-        
+
         logits = output_tensor.float()
-        log_probs_full = F.log_softmax(logits, dim=-1)
-        
-        # Depending on format: THD (packed) or BSHD (batch, seq, hidden)
-        # Let's handle generic format. Target tokens usually shift by 1.
-        # Suppose input is [seq_len, batch_size] or [seq_len * batch_size]
-        
-        logger.info(f"Logits shape: {logits.shape}, target tokens shape: {target_tokens.shape}")
-        
-        # Save logits to file for debug
+
+        # Normalize shape: always work with [seq_len, vocab_size]
+        if logits.dim() == 3:
+            logits = logits.view(-1, logits.size(-1))
+        elif logits.dim() != 2:
+            raise ValueError(f"Unexpected logits shape: {logits.shape}")
+
+        total_length = len(target_tokens)
+        # Follow get_responses() slicing: logits[prompt_length-1 : total_length-1]
+        # correspond to target tokens[prompt_length : total_length]
+        start_idx = prompt_length - 1
+        end_idx = total_length - 1
+
+        if start_idx >= 0 and end_idx > start_idx:
+            response_logits = logits[start_idx:end_idx]  # [response_length, vocab_size]
+            response_tokens = target_tokens[prompt_length:total_length].to(logits.device)
+
+            log_probs = F.log_softmax(response_logits, dim=-1)
+            token_log_probs = log_probs.gather(-1, response_tokens.unsqueeze(-1)).squeeze(-1)
+        else:
+            token_log_probs = torch.tensor([], device=logits.device)
+
         rank = dist.get_rank()
-        torch.save(logits.mean().detach().cpu(), f"logits_rank_{rank}.pt")
-        
-        # Extract logp for the given target tokens
-        # We'll just return it in a dict
-        return logits.mean(), {"logits": logits.mean().detach().cpu(), "log_probs_full": log_probs_full.mean().detach().cpu()}
+        mean_logp = token_log_probs.mean() if token_log_probs.numel() > 0 else torch.tensor(0.0, device=logits.device)
+        train_result = {
+            "response_tokens": response_tokens.detach().cpu(),
+            "response_logp": token_log_probs.detach().cpu(),
+            "prompt_length": prompt_length,
+            "response_length": response_length,
+            "mean_logp": mean_logp.detach().cpu(),
+            "input_token_ids": target_tokens.detach().cpu(),
+        }
+        torch.save(train_result, f"response_logp_rank_{rank}.pt")
+        logger.info(
+            f"[Rank {rank}] Prompt len={prompt_length}, Response len={response_length}, "
+            f"response_logp_mean={mean_logp.item():.6f}"
+        )
+        return mean_logp, {
+            "response_logp_mean": mean_logp.detach().cpu(),
+            "response_logp": token_log_probs.detach().cpu(),
+        }
     return loss_function
 
 def create_forward_step(args, tokens):
@@ -380,15 +418,15 @@ def create_forward_step(args, tokens):
             labels=None, packed_seq_params=packed_seq_params,
         )
 
-        return output_tensor, extract_logp_loss_function(target_tokens)
+        return output_tensor, extract_logp_loss_function(args, target_tokens)
 
     def forward_step_bshd(data_iterator, model, return_schedule_plan=False):
         assert not return_schedule_plan
-        
+
         pad_token_id = 0
         max_seqlen = args.seq_length
         pad = max_seqlen - tokens.size(0)
-        
+
         if pad > 0:
             padded_tokens = F.pad(tokens, (0, pad), value=pad_token_id)
         else:
@@ -396,11 +434,11 @@ def create_forward_step(args, tokens):
 
         # Shape [batch=1, seq_len]
         input_ids = to_device(padded_tokens.unsqueeze(0))
-        
+
         # position_ids [batch=1, seq_len]
         position_ids = torch.arange(max_seqlen, dtype=torch.long, device=input_ids.device)
         position_ids = position_ids.unsqueeze(0)
-        
+
         # Target tokens for logp extraction
         target_tokens = tokens.clone()
 
@@ -409,7 +447,7 @@ def create_forward_step(args, tokens):
             labels=None, packed_seq_params=None,
         )
 
-        return output_tensor, extract_logp_loss_function(target_tokens)
+        return output_tensor, extract_logp_loss_function(args, target_tokens)
     return forward_step_thd if getattr(args, "qkv_format", "bshd") == "thd" else forward_step_bshd
 
 
