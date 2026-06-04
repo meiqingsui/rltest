@@ -6,11 +6,12 @@
 
 本工作流提供一套**独立的测试脚本**，用于：
 1. 从 Rollout 侧（SGLang）对给定 prompt 生成 response 并提取 logp
-2. 从训练侧提取**同一组 response token** 的 response-only logp
-3. 离线对齐比对，量化逐 token 的训推差异
+2. 从训练侧（Megatron-LM）提取**同一组 response token** 的 response-only logp
+3. 从 HuggingFace Transformers 提取**同一组 response token** 的 logp 作为**纯净基准**
+4. 离线对齐比对，量化逐 token 的训推差异，并隔离偏差来源
 
-> **为什么先 Rollout 后 Train？**  
-> Rollout 生成 response token 是"真相来源"，训练侧必须基于完全相同的 token 序列计算 logp，才能进行 apples-to-apples 比对。若先指定 train 的 target tokens，rollout 生成的可能不同，导致 token mismatch。
+> **为什么先 Rollout 后 Train/HF？**  
+> Rollout 生成 response token 是"真相来源"，训练侧和 HF 基准必须基于完全相同的 token 序列计算 logp，才能进行 apples-to-apples 比对。若先指定 target tokens，rollout 生成的可能不同，导致 token mismatch。
 
 ---
 
@@ -18,11 +19,20 @@
 
 | 脚本 | 职责 | 输入 | 输出 |
 |------|------|------|------|
-| `test_train_logp.py` | 训练侧 logp 提取 | HuggingFace checkpoint + token IDs | `response_logp_rank_{rank}.pt` |
 | `test_rollout_logp.py` | Rollout 侧 logp 提取 | SGLang `/generate` endpoint + token IDs | `rollout_logp_result.json` |
+| `test_train_logp.py` | 训练侧 logp 提取 | HuggingFace checkpoint + token IDs | `response_logp_rank_{rank}.pt` |
+| `test_hf_logp.py` | HF 基准 logp 提取 | HuggingFace checkpoint + token IDs | `hf_logp_result.pt` |
 | `compare_train_rollout_logp.py` | 离线比对分析 | `.pt` + `.json` | `compare_result.json` + 可选 CSV/ASCII 图 |
 
-**设计原则**：采集与比对解耦，两端脚本只负责数据生产，`compare_train_rollout_logp.py` 负责所有分析逻辑，便于在不同环境/时间点复现比对。
+**设计原则**：采集与比对解耦，各端脚本只负责数据生产，`compare_train_rollout_logp.py` 负责所有分析逻辑，便于在不同环境/时间点复现比对。
+
+**三端比对矩阵**：
+
+| 比对组合 | 检测目标 |
+|----------|---------|
+| `test_train_logp.py` vs `test_hf_logp.py` | Megatron-LM / Bridge 实现是否有偏差 |
+| `test_rollout_logp.py` vs `test_hf_logp.py` | SGLang 推理引擎是否有偏差 |
+| `test_train_logp.py` vs `test_rollout_logp.py` | 端到端训推不一致 |
 
 ---
 
