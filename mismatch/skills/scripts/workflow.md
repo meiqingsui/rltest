@@ -156,14 +156,70 @@ torchrun --nproc_per_node=4 test_train_logp.py \
 
 ---
 
-### Step 3: 离线比对分析
+### Step 3: HF 基准采集 logp
+
+使用 HuggingFace `transformers` 原生推理计算同一组 token 的 logp，作为**纯净基准**。
 
 ```bash
-# 基础比对
+python test_hf_logp.py \
+    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
+    --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338" \
+    --response-length 5 \
+    --bf16 \
+    --output hf_logp_result.pt
+```
+
+**关键参数说明**：
+
+| 参数 | 说明 |
+|------|------|
+| `--hf-checkpoint` | HuggingFace 模型路径（与训练侧一致） |
+| `--test-tokens` | 逗号分隔的 token IDs，**完整序列**（prompt + rollout 生成的 response） |
+| `--response-length` | response token 数量（最后 N 个 token） |
+| `--bf16` / `--fp16` | 使用混合精度推理（推荐与训练侧一致） |
+| `--device` | 手动指定设备（`cuda:0`、`npu:0`、`cpu`） |
+
+**输出**：
+- `hf_logp_result.pt`
+- 文件内容为 dict，格式与 `test_train_logp.py` 完全一致：
+  ```python
+  {
+      "response_tokens": Tensor([response_length]),   # response token ids
+      "response_logp":  Tensor([response_length]),    # 逐 token logp
+      "prompt_length": int,
+      "response_length": int,
+      "mean_logp": float,
+      "input_token_ids": Tensor([total_length]),
+  }
+  ```
+
+**注意事项**：
+- `test_hf_logp.py` 是**单卡脚本**，不需要 `torchrun`，不依赖 Megatron/MindSpeed
+- 若 HF 结果与 Megatron 结果差异很大（`> 1e-4`），说明 Megatron-Bridge 或并行策略引入了偏差
+- 若 HF 结果与 SGLang 结果差异很大，说明 SGLang 推理引擎引入了偏差
+
+---
+
+### Step 4: 离线比对分析
+
+```bash
+# Train vs Rollout（端到端训推不一致）
 python compare_train_rollout_logp.py \
     --train-logp response_logp_rank_0.pt \
     --rollout-logp rollout_logp_result.json \
-    --output compare_result.json
+    --output compare_train_vs_rollout.json
+
+# Train vs HF（隔离 Megatron 偏差）
+python compare_train_rollout_logp.py \
+    --train-logp response_logp_rank_0.pt \
+    --rollout-logp hf_logp_result.pt \
+    --output compare_train_vs_hf.json
+
+# Rollout vs HF（隔离 SGLang 偏差）
+python compare_train_rollout_logp.py \
+    --train-logp hf_logp_result.pt \
+    --rollout-logp rollout_logp_result.json \
+    --output compare_rollout_vs_hf.json
 
 # 多 rank 批量比对 + CSV 明细 + ASCII 差异图
 python compare_train_rollout_logp.py \
@@ -324,36 +380,137 @@ python compare_train_rollout_logp.py ...
 
 ---
 
+### Case 4: 需要定位到具体层/算子的训推不一致
+
+**现象**：已知 Train 和 Rollout 的 logp 存在差异，但需要定位到**具体哪一层**开始出现差异。
+
+**排查步骤**（分层注入比对）：
+
+```bash
+# Step A: 检查权重一致性（排除权重转换问题）
+torchrun --nproc_per_node=1 check_weights.py \
+    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B_clip/ \
+    --tensor-model-parallel-size 1 \
+    --bf16 \
+    --skip-vision \
+    --no-skip-fused
+# 若 overall_max_diff > 1e-4，优先修复 Megatron-Bridge 权重转换问题
+
+# Step B: 采集 HF 基准的逐层激活
+torchrun --nproc_per_node=4 test_hf_logp.py \
+    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
+    --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338" \
+    --response-length 5 \
+    --bf16 \
+    --save-activations \
+    --output hf_logp_result.pt
+# 输出：hf_logp_result.pt + hf_logp_result.activations.pt
+
+# Step C: 采集 Megatron 的逐层激活（建议单卡 TP=1 PP=1 CP=1）
+torchrun --nproc_per_node=4 test_train_logp.py \
+    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
+    --tensor-model-parallel-size 4 \
+    --micro-batch-size 1 \
+    --pipeline-model-parallel-size 1 \
+    --context-parallel-size 1 \
+    --seq-length 2048 \
+    --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338" \
+    --response-length 5 \
+    --save-activations \
+    --qkv-format bshd
+
+# 输出：response_logp_rank_0.pt + megatron_activations_rank_0.pt
+
+# Step D: 逐层激活比对
+python compare_activations.py \
+    --baseline hf_logp_result.activations.pt \
+    --target megatron_activations_rank_0.pt \
+    --plot \
+    --output activation_compare.json
+
+# 分析输出：
+# - 若 embed_tokens 层差异很大 → Embedding/Position Embedding 问题
+# - 若 layer_0 开始差异大 → Attention/MLP/Norm 实现差异
+# - 若前几层一致、layer_N 开始发散 → 精度累积问题
+# - 若 norm/lm_head 层差异大 → Output projection 或 vocab parallel 问题
+```
+
+**逐层比对输出解读**：
+
+```
+============================================================
+  Layer-wise Activation Comparison
+============================================================
+  Baseline : hf_logp_result.activations.pt
+  Target   : megatron_activations_rank_0.pt
+  Matched  : 45 layers
+  Threshold: 0.0001
+------------------------------------------------------------
+  ✓ embed_tokens                            max_diff=1.2e-07 mean_diff=3.4e-08
+  ✓ layer_0                                max_diff=2.1e-07 mean_diff=5.6e-08
+  ✓ layer_1                                max_diff=1.8e-07 mean_diff=4.2e-08
+  ⚠️ layer_2                                max_diff=3.5e-04 mean_diff=8.2e-05   ← 首次发散
+  ⚠️ layer_3                                max_diff=1.2e-03 mean_diff=2.1e-04
+  ...
+------------------------------------------------------------
+  ⚠️ First layer exceeding threshold: layer_2
+     → Inspect layers BEFORE this point for weight/embedding issues
+     → Inspect THIS layer and AFTER for compute/activation issues
+============================================================
+```
+
+**定位策略**：
+
+| 首次发散位置 | 可能根因 |
+|-------------|---------|
+| `embed_tokens` | Token Embedding、Position Embedding、RoPE 初始化不一致 |
+| `layer_0` | Attention 实现（QKV 投影、Softmax、Scale）、MLP 实现、RMSNorm/LayerNorm |
+| `layer_N`（N>0） | 精度累积（bf16/fp16 舍入误差）、特定层的算子实现差异 |
+| `norm` / `lm_head` | Output projection、Vocab Parallel、最终 Norm 实现 |
+
+---
+
 ## 快速开始（最小示例）
 
 ```bash
-# 1. 启动 SGLang（单卡示例）
+# 0. 启动 SGLang（单卡示例）
 python3 -m sglang.launch_server \
     --model-path /mnt/sfs_turbo/models/Qwen3.5-9B/ \
     --port 30000
 
-# 2. Rollout 侧采集（先生成 response token）
+# 1. Rollout 侧采集（先生成 response token）
 python test_rollout_logp.py \
     --sglang-url http://localhost:30000/generate \
     --test-tokens "12, 134, 45, 10, 89" \
     --max-new-tokens 3 \
     --temperature 0.0
 
-# 3. 从 rollout 结果中获取 generated_token_ids，拼接成完整序列
+# 2. 从 rollout 结果中获取 generated_token_ids，拼接成完整序列
 # 假设 rollout 生成 [100, 200, 300]
-# 则训练侧 test-tokens = "12, 134, 45, 10, 89, 100, 200, 300"
+# 则完整 test-tokens = "12, 134, 45, 10, 89, 100, 200, 300"
 
+# 3. 训练侧采集（与 HF 基准可并行执行）
 torchrun --nproc_per_node=1 test_train_logp.py \
     --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
     --test-tokens "12, 134, 45, 10, 89, 100, 200, 300" \
     --response-length 3
 
-# 4. 比对
+python test_hf_logp.py \
+    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
+    --test-tokens "12, 134, 45, 10, 89, 100, 200, 300" \
+    --response-length 3 \
+    --bf16
+
+# 4. 三端比对
 python compare_train_rollout_logp.py \
     --train-logp response_logp_rank_0.pt \
     --rollout-logp rollout_logp_result.json \
-    --csv diff.csv \
-    --plot
+    --output compare_train_vs_rollout.json
+
+python compare_train_rollout_logp.py \
+    --train-logp response_logp_rank_0.pt \
+    --rollout-logp hf_logp_result.pt \
+    --output compare_train_vs_hf.json
 ```
 
 ---
@@ -362,8 +519,12 @@ python compare_train_rollout_logp.py \
 
 ```
 rltest/mismatch/skills/scripts/
-├── test_train_logp.py              # 训练侧 logp 提取
-├── test_rollout_logp.py            # Rollout 侧 logp 提取
-├── compare_train_rollout_logp.py   # 离线比对分析
+├── test_train_logp.py              # 训练侧 logp 提取（Megatron-LM）
+├── test_rollout_logp.py            # Rollout 侧 logp 提取（SGLang）
+├── test_hf_logp.py                 # HF 基准 logp 提取（transformers 原生）
+├── compare_train_rollout_logp.py   # 离线 logp 比对分析
+├── compare_activations.py          # 逐层激活比对分析
+├── check_weights.py                # 权重一致性检查
+├── encode_prompt.py                # Prompt 文本 → Token IDs
 └── workflow.md                     # 本文件
 ```

@@ -160,6 +160,8 @@ def _add_test_args(parser):
     group.add_argument("--response-length", type=int, default=None,
                        help="Length of response tokens (last N tokens). "
                             "If not set, all tokens except the first are treated as response.")
+    group.add_argument("--save-activations", action="store_true",
+                       help="Save intermediate activations (embedding, layers, norm, output) for layer-wise comparison")
     return parser
 
 
@@ -451,6 +453,45 @@ def create_forward_step(args, tokens):
     return forward_step_thd if getattr(args, "qkv_format", "bshd") == "thd" else forward_step_bshd
 
 
+def _register_megatron_hooks(model_chunk, activations: dict, rank: int):
+    """Register forward hooks on key modules for layer-wise comparison.
+
+    Hooks are registered on modules whose names contain:
+      - 'embed'  (token/position embedding)
+      - 'layer'  (transformer layers)
+      - 'norm'   (final layer norm / rms norm)
+      - 'output' (output projection / lm_head)
+
+    NOTE: For reliable full-layer activations, run with TP=1, PP=1, CP=1.
+    When TP > 1, activations are local to each TP rank (hidden dim is sharded).
+    """
+
+    def make_hook(name):
+        def hook(module, input, output):
+            if isinstance(output, tuple):
+                act = output[0]
+            else:
+                act = output
+            if not isinstance(act, torch.Tensor):
+                return
+            activations[name] = {
+                "output": act.detach().cpu().float(),
+                "output_shape": tuple(act.shape),
+                "module_class": module.__class__.__name__,
+            }
+
+        return hook
+
+    hooks = []
+    target_patterns = ["embed", "layer", "norm", "output"]
+    for name, module in model_chunk.named_modules():
+        if any(p in name.lower() for p in target_patterns):
+            h = module.register_forward_hook(make_hook(name))
+            hooks.append(h)
+            logger.info(f"[Rank {rank}] Hook registered: {name} ({module.__class__.__name__})")
+    return hooks
+
+
 def run_test():
     args = parse_test_args()
     try:
@@ -462,22 +503,28 @@ def run_test():
     if repatch is not None:
         repatch(args)
     init_distributed(args)
-    
+
     model, bridge = build_model_with_bridge(args)
     load_hf_weights(model, args, bridge)
-    
+
     for m in model:
         m.eval()
-    
+
+    # Register activation hooks if requested
+    activations = {}
+    hooks = []
+    if getattr(args, "save_activations", False):
+        hooks = _register_megatron_hooks(model[0], activations, args.rank)
+
     # Parse test tokens
     token_ids = [int(x.strip()) for x in args.test_tokens.split(",")]
     tokens = torch.tensor(token_ids, dtype=torch.long)
     logger.info(f"[Rank {args.rank}] Input tokens: {tokens}")
-    
+
     from megatron.core.pipeline_parallel import get_forward_backward_func
     forward_backward_func = get_forward_backward_func()
     forward_step = create_forward_step(args, tokens)
-    
+
     with torch.no_grad():
         output = forward_backward_func(
             forward_step_func=forward_step,
@@ -488,7 +535,23 @@ def run_test():
             micro_batch_size=int(args.micro_batch_size),
             forward_only=True,
         )
-    
+
+    # Save activations
+    if hooks:
+        for h in hooks:
+            h.remove()
+        act_path = f"megatron_activations_rank_{args.rank}.pt"
+        torch.save(activations, act_path)
+        logger.info(
+            f"[Rank {args.rank}] Activations saved to {act_path} "
+            f"({len(activations)} modules). "
+            f"TIP: Run with TP=1 PP=1 CP=1 for full (non-sharded) activations."
+        )
+        print(f"\n[Rank {args.rank}] Activation modules captured:")
+        for name, data in activations.items():
+            out = data["output"]
+            print(f"  {name:40s} shape={tuple(out.shape)} mean={out.mean():.6f} std={out.std():.6f}")
+
     logger.info(f"[Rank {args.rank}] Forward pass completed. Output: {output}")
     return 0
 

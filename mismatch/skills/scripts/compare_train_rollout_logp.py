@@ -5,15 +5,22 @@ Standalone comparison script for train-side vs rollout-side response logp.
 Reads:
     - Train output: response_logp_rank_{rank}.pt (from test_train_logp.py)
     - Rollout output: rollout_logp_result.json (from test_rollout_logp.py)
+                      or hf_logp_result.pt (from test_hf_logp.py)
 
 Computes per-token absolute/relative differences and aggregates mismatch metrics.
 
 Usage:
-    # Basic comparison
+    # Compare train (Megatron) vs rollout (SGLang)
     python compare_train_rollout_logp.py \
         --train-logp response_logp_rank_0.pt \
         --rollout-logp rollout_logp_result.json \
         --output compare_result.json
+
+    # Compare train (Megatron) vs HF baseline
+    python compare_train_rollout_logp.py \
+        --train-logp response_logp_rank_0.pt \
+        --rollout-logp hf_logp_result.pt \
+        --output compare_train_vs_hf.json
 
     # Compare multiple train ranks
     python compare_train_rollout_logp.py \
@@ -122,14 +129,49 @@ def load_train_data(train_path: str) -> dict | None:
 
 
 def load_rollout_data(rollout_path: str) -> dict | None:
-    """Load rollout-side logp data from JSON file."""
+    """Load rollout-side logp data from JSON or .pt file.
+
+    Supports:
+      - .json  : SGLang / native rollout format (generated_token_ids, generated_logprobs)
+      - .pt    : HF / train format (response_tokens, response_logp), same as test_hf_logp.py
+    """
     path = Path(rollout_path)
     if not path.exists():
         logger.warning(f"Rollout logp file not found: {rollout_path}")
         return None
 
+    # Try .pt format first (HF baseline / train format)
+    if path.suffix in (".pt", ".pth"):
+        try:
+            data = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as e:
+            logger.warning(f"Failed to load rollout logp {rollout_path}: {e}")
+            return None
+
+        if isinstance(data, dict):
+            logger.info(
+                f"Loaded rollout logp from {rollout_path} (HF/.pt format, "
+                f"response_len={data.get('response_length')})"
+            )
+            # Normalize to rollout-style keys
+            response_logp = data.get("response_logp", [])
+            if isinstance(response_logp, torch.Tensor):
+                response_logp = response_logp.tolist()
+            response_tokens = data.get("response_tokens", [])
+            if isinstance(response_tokens, torch.Tensor):
+                response_tokens = response_tokens.tolist()
+            return {
+                "generated_token_ids": response_tokens,
+                "generated_logprobs": response_logp,
+                "prompt_logprobs": [],
+                "request": {},
+            }
+        logger.warning(f"Unknown rollout .pt data type: {type(data)}")
+        return None
+
+    # Fall back to JSON format
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
         logger.warning(f"Failed to load rollout logp {rollout_path}: {e}")

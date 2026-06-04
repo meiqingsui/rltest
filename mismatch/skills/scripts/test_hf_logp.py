@@ -9,20 +9,33 @@ This serves as a clean, third-party baseline for Train-Inference Mismatch debugg
 Input/output format is kept identical to test_train_logp.py for easy interchangeability.
 
 Usage:
+    # Single-GPU / single-process
     python test_hf_logp.py \
         --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
         --test-tokens "12, 134, 45, 10, 89, 100, 200, 300" \
         --response-length 3 \
         --bf16 \
         --output hf_logp_result.pt
+
+    # Multi-GPU via torchrun (each rank holds a full copy; data-parallel style)
+
+    torchrun --nproc_per_node=4 test_hf_logp.py \
+    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
+    --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338" \
+    --response-length 5 \
+    --bf16 \
+    --save-activations \
+    --output hf_logp_result.pt
 """
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -43,6 +56,47 @@ def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda:0")
     return torch.device("cpu")
+
+
+def get_dist_backend() -> str:
+    return "hccl" if _is_npu_available() else "nccl"
+
+
+def init_distributed(tp_size: int = 1) -> int:
+    """Initialize distributed process group when running under torchrun.
+
+    Returns the current rank. If tp_size == 1 and no torchrun env is detected,
+    returns 0 without initializing distributed.
+    """
+    if tp_size <= 1:
+        # Check if we are under torchrun anyway (user may have omitted --tp-size)
+        if "RANK" not in os.environ:
+            return 0
+
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    if world_size > 1 and not dist.is_initialized():
+        backend = get_dist_backend()
+        dist.init_process_group(backend=backend)
+        logger.info(
+            f"Distributed initialized: rank={rank}, local_rank={local_rank}, "
+            f"world_size={world_size}, backend={backend}"
+        )
+
+    # Set device based on local_rank
+    if _is_npu_available():
+        import torch_npu
+        torch.npu.set_device(f"npu:{local_rank}")
+    elif torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
+    return rank
+
+
+def get_local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", 0))
 
 
 def parse_args() -> argparse.Namespace:
@@ -95,10 +149,28 @@ def parse_args() -> argparse.Namespace:
         default="hf_logp_result.pt",
         help="Output .pt file path",
     )
+    parser.add_argument(
+        "--save-activations",
+        action="store_true",
+        help="Save intermediate activations (embedding, each layer, norm, lm_head) for layer-wise comparison",
+    )
+    parser.add_argument(
+        "--activations-output",
+        type=str,
+        default=None,
+        help="Path to save activations .pt file. Default: <output>.activations.pt",
+    )
+    parser.add_argument(
+        "--tensor-model-parallel-size",
+        "--tp-size",
+        type=int,
+        default=1,
+        help="Tensor parallelism size. When > 1, launch via torchrun (e.g. torchrun --nproc_per_node=2 test_hf_logp.py --tp-size 2)",
+    )
     return parser.parse_args()
 
 
-def load_model(args: argparse.Namespace):
+def load_model(args: argparse.Namespace, rank: int = 0):
     """Load HF causal LM and move to target device."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -114,26 +186,105 @@ def load_model(args: argparse.Namespace):
     elif args.fp16:
         dtype = torch.float16
 
-    logger.info(f"Loading model from {args.hf_checkpoint} (dtype={dtype})")
+    # Determine target device
+    if args.device:
+        device = torch.device(args.device)
+    elif dist.is_initialized():
+        local_rank = get_local_rank()
+        acc = "npu" if _is_npu_available() else "cuda"
+        device = torch.device(f"{acc}:{local_rank}")
+    else:
+        device = get_device()
+
+    logger.info(f"Loading model from {args.hf_checkpoint} (dtype={dtype}, device={device})")
+
     model = AutoModelForCausalLM.from_pretrained(
         args.hf_checkpoint,
         torch_dtype=dtype,
         trust_remote_code=args.trust_remote_code,
-        device_map=None,  # we handle device placement manually
+        device_map=None,
     )
-
-    device = torch.device(args.device) if args.device else get_device()
     model = model.to(device)
     model.eval()
-
-    logger.info(f"Model loaded on {device}")
+    logger.info(f"[Rank {rank}] Model loaded on {device}")
     return model, tokenizer
+
+
+def register_activation_hooks(model, activations: dict):
+    """Register forward hooks on key layers to save intermediate activations.
+
+    Hooks are placed at:
+      - embed_tokens (input embedding)
+      - each transformer layer (layer_0, layer_1, ...)
+      - final norm
+      - lm_head (output projection)
+
+    Saved data per layer:
+      {
+          "output": Tensor detached to CPU (full activation),
+          "input_shape": tuple,
+          "output_shape": tuple,
+      }
+    """
+
+    def make_hook(name):
+        def hook(module, input, output):
+            # Transformer layers return tuples (hidden_states, ...)
+            if isinstance(output, tuple):
+                act = output[0]
+            else:
+                act = output
+
+            activations[name] = {
+                "input_shape": tuple(input[0].shape) if input and hasattr(input[0], "shape") else None,
+                "output_shape": tuple(act.shape) if hasattr(act, "shape") else None,
+                "output": act.detach().cpu().float(),
+            }
+
+        return hook
+
+    hooks = []
+    base_model = model.model if hasattr(model, "model") else model
+
+    # Embedding
+    if hasattr(base_model, "embed_tokens"):
+        h = base_model.embed_tokens.register_forward_hook(make_hook("embed_tokens"))
+        hooks.append(h)
+        logger.info("Hook registered: embed_tokens")
+
+    # Transformer layers
+    if hasattr(base_model, "layers"):
+        for i, layer in enumerate(base_model.layers):
+            h = layer.register_forward_hook(make_hook(f"layer_{i}"))
+            hooks.append(h)
+        logger.info(f"Hooks registered: {len(base_model.layers)} transformer layers")
+
+    # Final norm
+    if hasattr(base_model, "norm"):
+        h = base_model.norm.register_forward_hook(make_hook("norm"))
+        hooks.append(h)
+        logger.info("Hook registered: norm")
+
+    # LM Head
+    if hasattr(model, "lm_head"):
+        h = model.lm_head.register_forward_hook(make_hook("lm_head"))
+        hooks.append(h)
+        logger.info("Hook registered: lm_head")
+
+    return hooks
+
+
+def remove_hooks(hooks: list):
+    for h in hooks:
+        h.remove()
 
 
 def compute_response_logp(
     model,
     token_ids: list[int],
     response_length: int | None,
+    save_activations: bool = False,
+    rank: int = 0,
 ) -> dict:
     """Compute response-only logp, matching test_train_logp.py logic.
 
@@ -154,9 +305,18 @@ def compute_response_logp(
     device = next(model.parameters()).device
     input_ids = target_tokens.unsqueeze(0).to(device)  # [1, total_length]
 
+    activations = {}
+    hooks = []
+    if save_activations:
+        hooks = register_activation_hooks(model, activations)
+
     with torch.no_grad():
         outputs = model(input_ids)
         logits = outputs.logits.float()  # [1, total_length, vocab_size]
+
+    if hooks:
+        remove_hooks(hooks)
+        logger.info(f"[Rank {rank}] Captured {len(activations)} activation layers")
 
     # Squeeze batch dimension → [total_length, vocab_size]
     logits = logits.squeeze(0)
@@ -185,15 +345,21 @@ def compute_response_logp(
         "mean_logp": token_log_probs.mean().item(),
         "input_token_ids": target_tokens.cpu(),
     }
+    if activations:
+        result["activations"] = activations
     return result
 
 
 def main() -> int:
     args = parse_args()
 
+    # Initialize distributed if running under torchrun or tp-size > 1
+    rank = init_distributed(args.tensor_model_parallel_size)
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+
     # Parse token IDs
     token_ids = [int(x.strip()) for x in args.test_tokens.split(",")]
-    logger.info(f"Input token IDs: {token_ids} (length={len(token_ids)})")
+    logger.info(f"[Rank {rank}] Input token IDs: {token_ids} (length={len(token_ids)})")
 
     if len(token_ids) < 2:
         logger.error("Need at least 2 tokens (1 prompt + 1 response)")
@@ -201,45 +367,76 @@ def main() -> int:
 
     # Load model
     try:
-        model, tokenizer = load_model(args)
+        model, tokenizer = load_model(args, rank=rank)
     except Exception as e:
-        logger.error(f"Failed to load model: {e}")
+        logger.error(f"[Rank {rank}] Failed to load model: {e}")
         return 1
 
     # Compute logp
     try:
-        result = compute_response_logp(model, token_ids, args.response_length)
+        result = compute_response_logp(
+            model, token_ids, args.response_length,
+            save_activations=args.save_activations,
+            rank=rank,
+        )
     except Exception as e:
-        logger.error(f"Failed to compute logp: {e}")
+        logger.error(f"[Rank {rank}] Failed to compute logp: {e}")
         return 1
 
-    # Save
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(result, output_path)
-    logger.info(f"Result saved to {output_path.resolve()}")
+    # Save logp result (only rank 0 saves to avoid conflicts)
+    if rank == 0:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(result, output_path)
+        logger.info(f"[Rank {rank}] Result saved to {output_path.resolve()}")
 
-    # Print summary
-    print("\n" + "=" * 60)
-    print("  HF Baseline Logp Result")
-    print("=" * 60)
-    print(f"  Model            : {args.hf_checkpoint}")
-    print(f"  Input tokens     : {token_ids}")
-    print(f"  Prompt length    : {result['prompt_length']}")
-    print(f"  Response length  : {result['response_length']}")
-    print(f"  Response tokens  : {result['response_tokens'].tolist()}")
-    print(f"  Mean logp        : {result['mean_logp']:.6f}")
-    print(f"  Min  logp        : {result['response_logp'].min().item():.6f}")
-    print(f"  Max  logp        : {result['response_logp'].max().item():.6f}")
-    print("=" * 60)
+        # Save activations separately (they can be large)
+        if args.save_activations and "activations" in result:
+            act_output = args.activations_output or str(output_path.with_suffix(".activations.pt"))
+            act_path = Path(act_output)
+            act_path.parent.mkdir(parents=True, exist_ok=True)
+            # Pop activations from result to avoid duplicating in logp file
+            activations = result.pop("activations")
+            torch.save(activations, act_path)
+            logger.info(f"[Rank {rank}] Activations saved to {act_path.resolve()} ({len(activations)} layers)")
+            # Re-save result without activations
+            torch.save(result, output_path)
 
-    # Print ready-to-use compare command
-    print("\n  Ready-to-use compare command:")
-    print(f"    python compare_train_rollout_logp.py \\")
-    print(f"        --train-logp {args.output} \\")
-    print(f"        --rollout-logp rollout_logp_result.json \\")
-    print(f"        --output compare_result.json")
-    print("=" * 60)
+            # Print activation layer summary
+            print("\n  Activation layers captured:")
+            for name, data in activations.items():
+                out = data["output"]
+                print(f"    {name:20s}  shape={tuple(out.shape)}  mean={out.mean():.6f}  std={out.std():.6f}")
+
+        # Print summary
+        print("\n" + "=" * 60)
+        print("  HF Baseline Logp Result")
+        print("=" * 60)
+        print(f"  Model            : {args.hf_checkpoint}")
+        print(f"  TP size          : {args.tensor_model_parallel_size}")
+        print(f"  World size       : {world_size}")
+        print(f"  Input tokens     : {token_ids}")
+        print(f"  Prompt length    : {result['prompt_length']}")
+        print(f"  Response length  : {result['response_length']}")
+        print(f"  Response tokens  : {result['response_tokens'].tolist()}")
+        print(f"  Mean logp        : {result['mean_logp']:.6f}")
+        print(f"  Min  logp        : {result['response_logp'].min().item():.6f}")
+        print(f"  Max  logp        : {result['response_logp'].max().item():.6f}")
+        print("=" * 60)
+
+        # Print ready-to-use compare command
+        print("\n  Ready-to-use compare command:")
+        print(f"    python compare_train_rollout_logp.py \\")
+        print(f"        --train-logp {args.output} \\")
+        print(f"        --rollout-logp rollout_logp_result.json \\")
+        print(f"        --output compare_result.json")
+        print("=" * 60)
+    else:
+        logger.info(f"[Rank {rank}] Computation completed; output written by rank 0 only")
+
+    # Cleanup distributed
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
     return 0
 
