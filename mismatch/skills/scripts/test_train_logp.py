@@ -8,6 +8,7 @@ torchrun --nproc_per_node=2 test_train_logp.py \
     --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
     --tensor-model-parallel-size 2 \
     --micro-batch-size 1 --seq-length 2048 \
+    --use-flash-attn \
     --test-tokens "12, 134, 45, 10, 89" --qkv-format bshd
 """
 
@@ -327,6 +328,8 @@ def load_hf_weights(model, args: Namespace, bridge) -> None:
 
 def extract_logp_loss_function(args, target_tokens):
     """Compute response-only logp, matching relax/backends/megatron/loss.py::get_responses()."""
+    from megatron.core import mpu
+
     response_length = getattr(args, "response_length", None)
     if response_length is None or response_length <= 0:
         # Default: treat all tokens except the first as response (same as typical LM training)
@@ -340,6 +343,12 @@ def extract_logp_loss_function(args, target_tokens):
             return output_tensor, {}
 
         logits = output_tensor.float()
+        print(f"yzr {logits.shape=}")
+
+        # TP parallel: all-gather logits along vocab dimension before computing logp
+        if mpu.get_tensor_model_parallel_world_size() > 1:
+            from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+            logits = gather_from_tensor_model_parallel_region(logits)
 
         # Normalize shape: always work with [seq_len, vocab_size]
         if logits.dim() == 3:

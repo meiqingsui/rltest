@@ -119,7 +119,8 @@ torchrun --nproc_per_node=4 test_train_logp.py \
     --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
     --tensor-model-parallel-size 4 \
     --micro-batch-size 1 \
-    --seq-length 2048 \
+    --seq-length 57 \
+    --use-flash-attn \
     --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338, 369, 11751, 13, 271, 3710, 369, 279, 6511, 314, 9564, 30, 271, 760, 6511, 314, 9564, 369, 19241, 13, 271, 3710, 369, 279, 6511, 314, 14898, 30, 271, 760, 6511, 314, 14898, 369, 21047, 13, 271, 3710, 369, 279, 6511, 314, 17163, 30, 271, 760" \
     --response-length 50 \
     --qkv-format bshd
@@ -163,8 +164,8 @@ torchrun --nproc_per_node=4 test_train_logp.py \
 ```bash
 python test_hf_logp.py \
     --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
-    --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338" \
-    --response-length 5 \
+    --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338, 369, 11751, 13, 271, 3710, 369, 279, 6511, 314, 9564, 30, 271, 760, 6511, 314, 9564, 369, 19241, 13, 271, 3710, 369, 279, 6511, 314, 14898, 30, 271, 760, 6511, 314, 14898, 369, 21047, 13, 271, 3710, 369, 279, 6511, 314, 17163, 30, 271, 760" \
+    --response-length 57 \
     --bf16 \
     --output hf_logp_result.pt
 ```
@@ -397,8 +398,8 @@ torchrun --nproc_per_node=1 check_weights.py \
 # 若 overall_max_diff > 1e-4，优先修复 Megatron-Bridge 权重转换问题
 
 # Step B: 采集 HF 基准的逐层激活
-torchrun --nproc_per_node=4 test_hf_logp.py \
-    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
+python test_hf_logp.py \
+    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B_clip/ \
     --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338" \
     --response-length 5 \
     --bf16 \
@@ -408,12 +409,13 @@ torchrun --nproc_per_node=4 test_hf_logp.py \
 
 # Step C: 采集 Megatron 的逐层激活（建议单卡 TP=1 PP=1 CP=1）
 torchrun --nproc_per_node=4 test_train_logp.py \
-    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
+    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B_clip/ \
     --tensor-model-parallel-size 4 \
     --micro-batch-size 1 \
     --pipeline-model-parallel-size 1 \
     --context-parallel-size 1 \
     --seq-length 2048 \
+    --use-flash-attn \
     --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338" \
     --response-length 5 \
     --save-activations \
@@ -494,6 +496,7 @@ torchrun --nproc_per_node=1 test_train_logp.py \
     --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
     --test-tokens "12, 134, 45, 10, 89, 100, 200, 300" \
     --response-length 3
+    --use-flash-attn
 
 python test_hf_logp.py \
     --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
