@@ -548,6 +548,8 @@ python compare_activations.py \
 | `layer_N`（N>0） | 精度累积（bf16/fp16 舍入误差）、特定层的算子实现差异 |
 | `norm` / `lm_head` | Output projection、Vocab Parallel、最终 Norm 实现 |
 
+> **更深的定位（注入式二分）**：当上面逐层捕获找到首发散层后，要进一步定位到**层内具体算子**（尤其是 fused kernel 内部，如 NPU fused attn / fused RMSNorm / grouped MoE），用**注入式二分**方法论——见 skill `train-infer-mismatch-bisection`（`.claude/skills/train-infer-mismatch-bisection/SKILL.md`）。核心：`--dump-ref`/`--inject-ref`/`--force-ref`（任意子模块输入/输出注入）+ `--dump-fused-attn`/`--dump-attn-internals`（fused 内部 rotary/sparse/core dump）+ `compare-fused-attn`。GLM5 torchturbo vs HF 的完整定位链路在该 skill 里有工作样例。
+
 ---
 
 ## 快速开始（最小示例）

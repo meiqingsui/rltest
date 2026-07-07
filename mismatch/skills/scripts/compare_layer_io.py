@@ -589,6 +589,142 @@ def compare_weights(pt1: str, pt2: str,
 
 
 # --------------------------------------------------------------------------- #
+# Compare fused-attn dumps（实验F：定位 self_attn 内发散源）
+#   test_torchturbo3_logp.py --dump-fused-attn  vs  test_hf_logp.py --dump-attn-internals
+# 决定性两测：
+#   rotary : tt q_pe_postrotary [B,S,H,D] vs hf q_rot_postrotary [B,H,S,D]（transpose 对齐）
+#            —— tt 用 apply_rotary_pos_emb, hf 用 apply_rotary_pos_emb_interleave,不同函数
+#   sparse : tt topk_indices [T,1,topk] vs hf topk_indices [B,S,topk]（flatten 对齐,torch.equal）
+#            —— tt npu_lightning_indexer vs hf self.indexer
+# --------------------------------------------------------------------------- #
+def _cmp_fused_rotary(tag, tt, hf):
+    if tt is None or hf is None:
+        print(f"  rotary {tag}: skip (tt={'有' if tt is not None else '无'} "
+              f"hf={'有' if hf is not None else '无'})")
+        return None
+    tt = tt.float().cpu()
+    hf = hf.float().cpu()
+    # 布局固定: tt [B,S,H,D] (BSHD), hf [B,H,S,D] (BHSD) -> transpose(1,2) 对齐
+    if hf.dim() == 4:
+        hf = hf.transpose(1, 2).contiguous()
+    if tt.shape != hf.shape:
+        print(f"  rotary {tag}: SHAPE MISMATCH tt={list(tt.shape)} "
+              f"hf(aligned)={list(hf.shape)}")
+        return None
+    d = (tt - hf).abs()
+    denom = hf.abs().clamp_min(1e-12)
+    max_abs = d.max().item()
+    mean_abs = d.mean().item()
+    max_rel = (d / denom).max().item()
+    bit = torch.equal(tt, hf)
+    verdict = "一致" if max_abs < DEFAULT_ABS_TOL else "<< 不一致"
+    print(f"  rotary {tag} shape={list(tt.shape)} max={max_abs:.3e} "
+          f"mean={mean_abs:.3e} rel={max_rel:.3e} bit={bit}  {verdict}")
+    return max_abs
+
+
+def _cmp_fused_sparse(tt, hf):
+    if tt is None or hf is None:
+        print(f"  sparse indices: skip (tt={'有' if tt is not None else '无'} "
+              f"hf={'有' if hf is not None else '无'})")
+        return None
+    tt = tt.cpu().to(torch.int64)
+    hf = hf.cpu().to(torch.int64)
+    # 对齐: tt [T,1,topk] -> [T,topk]; hf [B,S,topk] -> [T,topk]
+    tt2 = tt.reshape(-1, tt.shape[-1])
+    hf2 = hf.reshape(-1, hf.shape[-1])
+    if tt2.shape != hf2.shape:
+        print(f"  sparse indices: SHAPE MISMATCH tt={list(tt2.shape)} hf={list(hf2.shape)}")
+        return None
+    bit = torch.equal(tt2, hf2)
+    diff_rows = int((tt2 != hf2).any(dim=-1).sum().item())
+    total_rows = tt2.shape[0]
+    pct = diff_rows / total_rows * 100 if total_rows else 0
+    # 每行 topk 重叠率(平均)
+    if tt2.shape[-1] > 0:
+        overlap = 0.0
+        for r in range(total_rows):
+            overlap += len(set(tt2[r].tolist()) & set(hf2[r].tolist())) / tt2.shape[-1]
+        overlap /= total_rows if total_rows else 1
+    else:
+        overlap = 0.0
+    verdict = "一致" if bit else "<< 不一致"
+    print(f"  sparse indices shape={list(tt2.shape)} bit_id={bit} "
+          f"diff_rows={diff_rows}/{total_rows}({pct:.1f}%) avg_overlap={overlap:.3f}  {verdict}")
+    if not bit and diff_rows > 0:
+        r = int((tt2 != hf2).any(dim=-1).nonzero()[0].item())
+        print(f"    首个不同行 row={r}: tt={tt2[r].tolist()} hf={hf2[r].tolist()}")
+    return diff_rows
+
+
+def compare_fused_attn(tt_dir: str, hf_dir: str):
+    tt_dir, hf_dir = Path(tt_dir), Path(hf_dir)
+
+    def _layers(d):
+        out = {}
+        for f in d.glob("layer_*.pt"):
+            try:
+                out[int(f.stem.split("_")[1])] = f
+            except (IndexError, ValueError):
+                continue
+        return out
+
+    tt_layers, hf_layers = _layers(tt_dir), _layers(hf_dir)
+    layers = sorted(set(tt_layers) | set(hf_layers))
+    print(f"\n=== Compare fused-attn: {tt_dir}  vs  {hf_dir} ===")
+    print(f"    layers: {sorted(tt_layers)} vs {sorted(hf_layers)} "
+          f"(union {len(layers)})\n")
+
+    first_rot_div = None
+    first_sparse_div = None
+    for i in layers:
+        print(f"[layer {i}]")
+        if i not in tt_layers or i not in hf_layers:
+            print(f"  only in {'tt' if i in tt_layers else 'hf'}")
+            continue
+        tt = torch.load(tt_layers[i], map_location="cpu", weights_only=False)
+        hf = torch.load(hf_layers[i], map_location="cpu", weights_only=False)
+        qd = _cmp_fused_rotary("q", tt.get("q_pe_postrotary"), hf.get("q_rot_postrotary"))
+        kd = _cmp_fused_rotary("k", tt.get("k_pe_postrotary"), hf.get("k_rot_postrotary"))
+        if qd is not None and qd >= DEFAULT_ABS_TOL and first_rot_div is None:
+            first_rot_div = ("q", i, qd)
+        if kd is not None and kd >= DEFAULT_ABS_TOL and first_rot_div is None:
+            first_rot_div = ("k", i, kd)
+        sd = _cmp_fused_sparse(tt.get("topk_indices"), hf.get("topk_indices"))
+        if sd is not None and sd > 0 and first_sparse_div is None:
+            first_sparse_div = (i, sd)
+        # absorb / core 信息行(无 HF 直接对照,仅打印 tt 侧统计)
+        qa = tt.get("q_nope_absorbed")
+        if isinstance(qa, torch.Tensor):
+            print(f"  [info] tt q_nope_absorbed shape={list(qa.shape)} "
+                  f"norm={qa.float().norm().item():.3e} (MLA absorb Q@W_UK,无 HF 直接对照)")
+        co = tt.get("core_attn_output")
+        if isinstance(co, torch.Tensor):
+            print(f"  [info] tt core_attn_output shape={list(co.shape)} "
+                  f"(npu_sparse_flash_attention 输出,W_UV absorb 前)")
+
+    print("\n" + "=" * 60)
+    if first_rot_div is None:
+        print(">>> rotary: post-rotary Q/K 全一致 -> rotary 非发散源")
+    else:
+        which, li, val = first_rot_div
+        print(f">>> rotary 首发散: layer_{li} {which} (max={val:.3e})")
+        print("    -> apply_rotary_pos_emb(turbo) vs apply_rotary_pos_emb_interleave(HF) "
+              "不同 rotary 函数,坐实 rotary 为发散源")
+    if first_sparse_div is None:
+        print(">>> sparse: topk_indices 全一致 -> 稀疏选择非发散源")
+    else:
+        li, n = first_sparse_div
+        print(f">>> sparse 首发散: layer_{li} ({n} 行不同)")
+        print("    -> npu_lightning_indexer(turbo) vs self.indexer(HF) 稀疏选择不同")
+    if first_rot_div is None and first_sparse_div is None:
+        print(">>> rotary+sparse 均一致: 发散在 MLA absorb(数值) 或 core kernel "
+              "(npu_sparse_flash_attention),需对照 core_attn_output / kv_b_proj 输出")
+    print("=" * 60)
+    return {"first_rotary_div": first_rot_div, "first_sparse_div": first_sparse_div}
+
+
+# --------------------------------------------------------------------------- #
 # CLI dump（自包含 native baseline）
 # --------------------------------------------------------------------------- #
 def _build_native_model(path: str, device: str, dtype: torch.dtype,
@@ -723,6 +859,14 @@ def main():
     pw.add_argument("--rel-tol", type=float, default=DEFAULT_REL_TOL)
     pw.set_defaults(func=lambda a: compare_weights(a.pt1, a.pt2,
                                                    a.abs_tol, a.rel_tol))
+
+    pf = sub.add_parser("compare-fused-attn",
+                        help="实验F: 对比 --dump-fused-attn(turbo) 与 "
+                             "--dump-attn-internals(HF) 目录,定位 self_attn 内发散源 "
+                             "(rotary / sparse indexer)")
+    pf.add_argument("tt_dir", help="torchturbo --dump-fused-attn 目录")
+    pf.add_argument("hf_dir", help="HF --dump-attn-internals 目录")
+    pf.set_defaults(func=lambda a: compare_fused_attn(a.tt_dir, a.hf_dir))
     args = p.parse_args()
     args.func(args)
 
