@@ -8,6 +8,7 @@ This serves as a clean, third-party baseline for Train-Inference Mismatch debugg
 
 Input/output format is kept identical to test_train_logp.py for easy interchangeability.
 
+pip install accelerate
 Usage:
     # Single-GPU / single-process
     python test_hf_logp.py \
@@ -19,10 +20,10 @@ Usage:
 
     # Multi-GPU via torchrun (each rank holds a full copy; data-parallel style)
 
-    torchrun --nproc_per_node=4 test_hf_logp.py \
-    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
-    --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338" \
-    --response-length 5 \
+    torchrun --nproc_per_node=1 test_hf_logp.py \
+    --hf-checkpoint /storage/yzr02346555/gyy_Asystem/glm5_mini_bf16 \
+    --test-tokens "12,134,45,10,89" \
+    --response-length 4 \
     --bf16 \
     --save-activations \
     --output hf_logp_result.pt
@@ -40,6 +41,69 @@ import torch.nn.functional as F
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def parse_test_tokens(arg: str) -> list[int]:
+    """Parse --test-tokens: a comma-separated string OR a path to a token file.
+
+    A value that points to an existing file is loaded from the file; otherwise
+    it is parsed inline as a comma-separated token list. Supported file formats:
+      - .txt/.csv : any integers in the text (one per line, or comma/space/
+                    newline separated; optional brackets are fine)
+      - .json     : a list of ints, or an object with a tokens/input_ids/
+                    input_token_ids/response_tokens field
+      - .pt/.pth  : a tensor/list of ints, or a saved result dict with
+                    input_token_ids/response_tokens (round-trippable from the
+                    other test_*_logp.py outputs)
+    """
+    import os
+    value = arg.strip()
+    if value and os.path.isfile(value):
+        return _load_tokens_from_file(value)
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    try:
+        return [int(p) for p in parts]
+    except ValueError as e:
+        raise ValueError(
+            f"--test-tokens={arg!r} is neither an existing file nor a "
+            f"comma-separated list of integers."
+        ) from e
+
+
+def _load_tokens_from_file(path: str) -> list[int]:
+    import json
+    import os
+    import re
+
+    def _coerce(data) -> list[int]:
+        if isinstance(data, dict):
+            for k in ("tokens", "token_ids", "input_ids", "input_token_ids", "response_tokens"):
+                if k in data:
+                    data = data[k]
+                    break
+            else:
+                for v in data.values():
+                    if isinstance(v, (list, tuple)) or hasattr(v, "flatten"):
+                        data = v
+                        break
+        if hasattr(data, "flatten") and hasattr(data, "tolist"):  # torch/numpy tensor
+            data = data.flatten().tolist()
+        if isinstance(data, (list, tuple)):
+            return [int(t) for t in data]
+        raise ValueError(f"Unsupported token content in {path!r}: {type(data).__name__}")
+
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix in (".pt", ".pth"):
+        import torch
+        return _coerce(torch.load(path, map_location="cpu", weights_only=False))
+    if suffix == ".json":
+        with open(path, "r", encoding="utf-8") as f:
+            return _coerce(json.load(f))
+    with open(path, "r", encoding="utf-8") as f:
+        nums = re.findall(r"-?\d+", f.read())
+    if not nums:
+        raise ValueError(f"No token IDs found in file {path!r}")
+    return [int(n) for n in nums]
 
 
 def _is_npu_available() -> bool:
@@ -113,7 +177,7 @@ def parse_args() -> argparse.Namespace:
         "--test-tokens",
         type=str,
         default="10,11,12,13,14,15,16,17",
-        help="Comma-separated token IDs (full sequence: prompt + response)",
+        help="Comma-separated token IDs, or path to a token file (.txt/.json/.pt) (full sequence: prompt + response)",
     )
     parser.add_argument(
         "--response-length",
@@ -358,7 +422,7 @@ def main() -> int:
     world_size = dist.get_world_size() if dist.is_initialized() else 1
 
     # Parse token IDs
-    token_ids = [int(x.strip()) for x in args.test_tokens.split(",")]
+    token_ids = parse_test_tokens(args.test_tokens)
     logger.info(f"[Rank {rank}] Input token IDs: {token_ids} (length={len(token_ids)})")
 
     if len(token_ids) < 2:

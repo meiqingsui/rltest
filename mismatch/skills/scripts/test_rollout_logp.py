@@ -41,6 +41,69 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 logger = logging.getLogger(__name__)
 
 
+def parse_test_tokens(arg: str) -> list[int]:
+    """Parse --test-tokens: a comma-separated string OR a path to a token file.
+
+    A value that points to an existing file is loaded from the file; otherwise
+    it is parsed inline as a comma-separated token list. Supported file formats:
+      - .txt/.csv : any integers in the text (one per line, or comma/space/
+                    newline separated; optional brackets are fine)
+      - .json     : a list of ints, or an object with a tokens/input_ids/
+                    input_token_ids/response_tokens field
+      - .pt/.pth  : a tensor/list of ints, or a saved result dict with
+                    input_token_ids/response_tokens (round-trippable from the
+                    other test_*_logp.py outputs)
+    """
+    import os
+    value = arg.strip()
+    if value and os.path.isfile(value):
+        return _load_tokens_from_file(value)
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    try:
+        return [int(p) for p in parts]
+    except ValueError as e:
+        raise ValueError(
+            f"--test-tokens={arg!r} is neither an existing file nor a "
+            f"comma-separated list of integers."
+        ) from e
+
+
+def _load_tokens_from_file(path: str) -> list[int]:
+    import json
+    import os
+    import re
+
+    def _coerce(data) -> list[int]:
+        if isinstance(data, dict):
+            for k in ("tokens", "token_ids", "input_ids", "input_token_ids", "response_tokens"):
+                if k in data:
+                    data = data[k]
+                    break
+            else:
+                for v in data.values():
+                    if isinstance(v, (list, tuple)) or hasattr(v, "flatten"):
+                        data = v
+                        break
+        if hasattr(data, "flatten") and hasattr(data, "tolist"):  # torch/numpy tensor
+            data = data.flatten().tolist()
+        if isinstance(data, (list, tuple)):
+            return [int(t) for t in data]
+        raise ValueError(f"Unsupported token content in {path!r}: {type(data).__name__}")
+
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix in (".pt", ".pth"):
+        import torch
+        return _coerce(torch.load(path, map_location="cpu", weights_only=False))
+    if suffix == ".json":
+        with open(path, "r", encoding="utf-8") as f:
+            return _coerce(json.load(f))
+    with open(path, "r", encoding="utf-8") as f:
+        nums = re.findall(r"-?\d+", f.read())
+    if not nums:
+        raise ValueError(f"No token IDs found in file {path!r}")
+    return [int(n) for n in nums]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract logp from SGLang rollout for train-inference mismatch debugging"
@@ -55,7 +118,7 @@ def parse_args() -> argparse.Namespace:
         "--test-tokens",
         type=str,
         default="10,11,12,13,14,15,16,17",
-        help="Comma-separated list of token IDs to send as input_ids",
+        help="Comma-separated list of token IDs to send as input_ids, or path to a token file (.txt/.json/.pt)",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -165,7 +228,7 @@ def main() -> int:
     args = parse_args()
 
     # Parse token IDs (same format as test_train_logp.py)
-    token_ids = [int(x.strip()) for x in args.test_tokens.split(",")]
+    token_ids = parse_test_tokens(args.test_tokens)
     logger.info(f"Input token IDs: {token_ids} (length={len(token_ids)})")
 
     max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else len(token_ids)

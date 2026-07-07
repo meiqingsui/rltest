@@ -8,7 +8,8 @@
 1. 从 Rollout 侧（SGLang）对给定 prompt 生成 response 并提取 logp
 2. 从训练侧（Megatron-LM）提取**同一组 response token** 的 response-only logp
 3. 从 HuggingFace Transformers 提取**同一组 response token** 的 logp 作为**纯净基准**
-4. 离线对齐比对，量化逐 token 的训推差异，并隔离偏差来源
+4. 从 vLLM 推理引擎提取**同一组 response token** 的 logp，隔离 vLLM 推理侧偏差
+5. 离线对齐比对，量化逐 token 的训推差异，并隔离偏差来源
 
 > **为什么先 Rollout 后 Train/HF？**  
 > Rollout 生成 response token 是"真相来源"，训练侧和 HF 基准必须基于完全相同的 token 序列计算 logp，才能进行 apples-to-apples 比对。若先指定 target tokens，rollout 生成的可能不同，导致 token mismatch。
@@ -22,17 +23,21 @@
 | `test_rollout_logp.py` | Rollout 侧 logp 提取 | SGLang `/generate` endpoint + token IDs | `rollout_logp_result.json` |
 | `test_train_logp.py` | 训练侧 logp 提取 | HuggingFace checkpoint + token IDs | `response_logp_rank_{rank}.pt` |
 | `test_hf_logp.py` | HF 基准 logp 提取 | HuggingFace checkpoint + token IDs | `hf_logp_result.pt` |
+| `test_vllm_logp.py` | vLLM 推理侧 logp 提取 | vLLM 模型路径 + token IDs | `vllm_logp_result.pt` |
 | `compare_train_rollout_logp.py` | 离线比对分析 | `.pt` + `.json` | `compare_result.json` + 可选 CSV/ASCII 图 |
 
 **设计原则**：采集与比对解耦，各端脚本只负责数据生产，`compare_train_rollout_logp.py` 负责所有分析逻辑，便于在不同环境/时间点复现比对。
 
-**三端比对矩阵**：
+**四端比对矩阵**：
 
 | 比对组合 | 检测目标 |
 |----------|---------|
 | `test_train_logp.py` vs `test_hf_logp.py` | Megatron-LM / Bridge 实现是否有偏差 |
 | `test_rollout_logp.py` vs `test_hf_logp.py` | SGLang 推理引擎是否有偏差 |
-| `test_train_logp.py` vs `test_rollout_logp.py` | 端到端训推不一致 |
+| `test_vllm_logp.py` vs `test_hf_logp.py` | vLLM 推理引擎是否有偏差 |
+| `test_train_logp.py` vs `test_rollout_logp.py` | 端到端训推不一致（SGLang rollout） |
+| `test_train_logp.py` vs `test_vllm_logp.py` | 端到端训推不一致（vLLM rollout） |
+| `test_rollout_logp.py` vs `test_vllm_logp.py` | SGLang 与 vLLM 推理引擎差异 |
 
 ---
 
@@ -81,7 +86,7 @@ python test_rollout_logp.py \
 | 参数 | 说明 |
 |------|------|
 | `--sglang-url` | SGLang `/generate` 端点地址 |
-| `--test-tokens` | 作为 `input_ids` 传入 SGLang 的 token IDs（即 prompt） |
+| `--test-tokens` | 作为 `input_ids` 传入 SGLang 的 token IDs（即 prompt），逗号分隔或 token 文件路径（`.txt`/`.json`/`.pt`） |
 | `--max-new-tokens` | SGLang 生成的最大新 token 数。默认等于 `len(test-tokens)` |
 | `--temperature` | 采样温度。建议设为 `0.0`（greedy），确保生成确定性结果便于比对 |
 | `--return-prompt-logprob` | 可选，请求 SGLang 返回 prompt token 的 logp（需 SGLang 版本支持） |
@@ -119,8 +124,7 @@ torchrun --nproc_per_node=4 test_train_logp.py \
     --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
     --tensor-model-parallel-size 4 \
     --micro-batch-size 1 \
-    --seq-length 57 \
-    --use-flash-attn \
+    --seq-length 2048 \
     --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338, 369, 11751, 13, 271, 3710, 369, 279, 6511, 314, 9564, 30, 271, 760, 6511, 314, 9564, 369, 19241, 13, 271, 3710, 369, 279, 6511, 314, 14898, 30, 271, 760, 6511, 314, 14898, 369, 21047, 13, 271, 3710, 369, 279, 6511, 314, 17163, 30, 271, 760" \
     --response-length 50 \
     --qkv-format bshd
@@ -132,7 +136,7 @@ torchrun --nproc_per_node=4 test_train_logp.py \
 |------|------|
 | `--hf-checkpoint` | HuggingFace 模型路径（与 Relax 训练使用的一致） |
 | `--tensor-model-parallel-size` | TP 大小，需与 SGLang 侧模型并行配置一致 |
-| `--test-tokens` | 逗号分隔的 token IDs，**完整序列**（prompt + rollout 生成的 response） |
+| `--test-tokens` | 逗号分隔的 token IDs，或 token 文件路径（`.txt`/`.json`/`.pt`）；**完整序列**（prompt + rollout 生成的 response） |
 | `--response-length` | response token 数量（最后 N 个 token）。不指定时默认除第一个 token 外全部作为 response |
 | `--qkv-format` | `bshd` 或 `thd`，需与 Relax 训练配置一致 |
 
@@ -164,8 +168,8 @@ torchrun --nproc_per_node=4 test_train_logp.py \
 ```bash
 python test_hf_logp.py \
     --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
-    --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338, 369, 11751, 13, 271, 3710, 369, 279, 6511, 314, 9564, 30, 271, 760, 6511, 314, 9564, 369, 19241, 13, 271, 3710, 369, 279, 6511, 314, 14898, 30, 271, 760, 6511, 314, 14898, 369, 21047, 13, 271, 3710, 369, 279, 6511, 314, 17163, 30, 271, 760" \
-    --response-length 57 \
+    --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338" \
+    --response-length 5 \
     --bf16 \
     --output hf_logp_result.pt
 ```
@@ -175,7 +179,7 @@ python test_hf_logp.py \
 | 参数 | 说明 |
 |------|------|
 | `--hf-checkpoint` | HuggingFace 模型路径（与训练侧一致） |
-| `--test-tokens` | 逗号分隔的 token IDs，**完整序列**（prompt + rollout 生成的 response） |
+| `--test-tokens` | 逗号分隔的 token IDs，或 token 文件路径（`.txt`/`.json`/`.pt`）；**完整序列**（prompt + rollout 生成的 response） |
 | `--response-length` | response token 数量（最后 N 个 token） |
 | `--bf16` / `--fp16` | 使用混合精度推理（推荐与训练侧一致） |
 | `--device` | 手动指定设备（`cuda:0`、`npu:0`、`cpu`） |
@@ -201,6 +205,69 @@ python test_hf_logp.py \
 
 ---
 
+### Step 3b: vLLM 推理侧采集 logp
+
+使用 vLLM 离线推理对同一组 token 计算 logp，隔离 **vLLM 推理引擎**的偏差。脚本将完整序列作为 `prompt_token_ids` 传入，通过 `prompt_logprobs` 读取每个 token 的 logp，切片逻辑与 `test_hf_logp.py` 完全一致。
+
+```bash
+# 通用模型（单卡 / vLLM 内部管理 TP，无需 torchrun）
+python test_vllm_logp.py \
+    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
+    --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760" \
+    --response-length 5 \
+    --bf16 \
+    --tensor-parallel-size 1 \
+    --output vllm_logp_result.pt
+
+# 对齐 offline.py 的 DeepSeek-V4 部署配置
+python test_vllm_logp.py \
+    --model /storage/models/DeepSeek-V4-Flash-BF16_hym_cut_layer \
+    --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760" \
+    --response-length 5 \
+    --tensor-parallel-size 4 \
+    --enable-return-routed-experts \
+    --mamba-cache-dtype float32 \
+    --enforce-eager \
+    --gpu-memory-utilization 0.65 \
+    --output vllm_logp_result.pt
+```
+
+**关键参数说明**：
+
+| 参数 | 说明 |
+|------|------|
+| `--model` / `--hf-checkpoint` | 模型路径（vLLM `LLM(model=...)`）。`--hf-checkpoint` 为别名，便于与其他脚本互换 |
+| `--test-tokens` | 逗号分隔的 token IDs，或 token 文件路径（`.txt`/`.json`/`.pt`）；**完整序列**（prompt + rollout 生成的 response） |
+| `--response-length` | response token 数量（最后 N 个 token）。不指定时默认除第一个 token 外全部作为 response |
+| `--bf16` / `--fp16` | 混合精度推理（推荐与训练侧一致） |
+| `--tensor-parallel-size` | TP 大小。vLLM 内部管理，**无需 torchrun** |
+| `--enforce-eager` | 关闭 CUDA graph，便于精确比对 / 调试 |
+| `--enable-prefix-caching` | 默认关闭（保证干净比对路径） |
+| `--mamba-cache-dtype` / `--enable-return-routed-experts` | DeepSeek-V4 等混合/MoE 模型专用（可选） |
+
+**输出**：
+- `vllm_logp_result.pt`
+- 文件内容为 dict，格式与 `test_hf_logp.py` / `test_train_logp.py` 完全一致：
+  ```python
+  {
+      "response_tokens": Tensor([response_length]),   # response token ids
+      "response_logp":  Tensor([response_length]),    # 逐 token logp（ln）
+      "prompt_length": int,
+      "response_length": int,
+      "mean_logp": float,
+      "input_token_ids": Tensor([total_length]),
+  }
+  ```
+
+**注意事项**：
+- `test_vllm_logp.py` 通过 `prompt_logprobs` 读取**给定 token** 的 logp（不生成新 token），与 `test_hf_logp.py` 的 `model(input_ids)` 路径一一对应：`prompt_logprobs[i]` 即 `logits[i-1]` 对 `token[i]` 的预测
+- vLLM 的 `prompt_logprobs` 为自然对数（ln），与 `F.log_softmax` 一致，无需转换
+- 传 `prompt_token_ids` 时 vLLM **不添加 BOS**，与 HF `model(input_ids)` 行为一致
+- vLLM 始终在返回的 logprob 字典中包含**实际 token**（即便不在 top-N 内），gather 不会漏取
+- 若 vLLM 结果与 HF 差异很大（`> 1e-4`），说明 vLLM 推理引擎（attention 后端、KV cache、精度策略等）引入了偏差
+
+---
+
 ### Step 4: 离线比对分析
 
 ```bash
@@ -221,6 +288,18 @@ python compare_train_rollout_logp.py \
     --train-logp hf_logp_result.pt \
     --rollout-logp rollout_logp_result.json \
     --output compare_rollout_vs_hf.json
+
+# vLLM vs HF（隔离 vLLM 偏差）
+python compare_train_rollout_logp.py \
+    --train-logp hf_logp_result.pt \
+    --rollout-logp vllm_logp_result.pt \
+    --output compare_vllm_vs_hf.json
+
+# Train vs vLLM（端到端训推不一致，vLLM rollout）
+python compare_train_rollout_logp.py \
+    --train-logp response_logp_rank_0.pt \
+    --rollout-logp vllm_logp_result.pt \
+    --output compare_train_vs_vllm.json
 
 # 多 rank 批量比对 + CSV 明细 + ASCII 差异图
 python compare_train_rollout_logp.py \
@@ -398,8 +477,8 @@ torchrun --nproc_per_node=1 check_weights.py \
 # 若 overall_max_diff > 1e-4，优先修复 Megatron-Bridge 权重转换问题
 
 # Step B: 采集 HF 基准的逐层激活
-python test_hf_logp.py \
-    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B_clip/ \
+torchrun --nproc_per_node=4 test_hf_logp.py \
+    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
     --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338" \
     --response-length 5 \
     --bf16 \
@@ -409,13 +488,12 @@ python test_hf_logp.py \
 
 # Step C: 采集 Megatron 的逐层激活（建议单卡 TP=1 PP=1 CP=1）
 torchrun --nproc_per_node=4 test_train_logp.py \
-    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B_clip/ \
+    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
     --tensor-model-parallel-size 4 \
     --micro-batch-size 1 \
     --pipeline-model-parallel-size 1 \
     --context-parallel-size 1 \
     --seq-length 2048 \
-    --use-flash-attn \
     --test-tokens "3710, 369, 279, 6511, 314, 9338, 30, 271, 760, 6511, 314, 9338" \
     --response-length 5 \
     --save-activations \
@@ -491,12 +569,11 @@ python test_rollout_logp.py \
 # 假设 rollout 生成 [100, 200, 300]
 # 则完整 test-tokens = "12, 134, 45, 10, 89, 100, 200, 300"
 
-# 3. 训练侧采集（与 HF 基准可并行执行）
+# 3. 训练侧采集（与 HF / vLLM 基准可并行执行）
 torchrun --nproc_per_node=1 test_train_logp.py \
     --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
     --test-tokens "12, 134, 45, 10, 89, 100, 200, 300" \
     --response-length 3
-    --use-flash-attn
 
 python test_hf_logp.py \
     --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
@@ -504,7 +581,13 @@ python test_hf_logp.py \
     --response-length 3 \
     --bf16
 
-# 4. 三端比对
+python test_vllm_logp.py \
+    --hf-checkpoint /mnt/sfs_turbo/models/Qwen3.5-9B/ \
+    --test-tokens "12, 134, 45, 10, 89, 100, 200, 300" \
+    --response-length 3 \
+    --bf16
+
+# 4. 四端比对
 python compare_train_rollout_logp.py \
     --train-logp response_logp_rank_0.pt \
     --rollout-logp rollout_logp_result.json \
@@ -514,6 +597,11 @@ python compare_train_rollout_logp.py \
     --train-logp response_logp_rank_0.pt \
     --rollout-logp hf_logp_result.pt \
     --output compare_train_vs_hf.json
+
+python compare_train_rollout_logp.py \
+    --train-logp hf_logp_result.pt \
+    --rollout-logp vllm_logp_result.pt \
+    --output compare_vllm_vs_hf.json
 ```
 
 ---
@@ -525,6 +613,7 @@ rltest/mismatch/skills/scripts/
 ├── test_train_logp.py              # 训练侧 logp 提取（Megatron-LM）
 ├── test_rollout_logp.py            # Rollout 侧 logp 提取（SGLang）
 ├── test_hf_logp.py                 # HF 基准 logp 提取（transformers 原生）
+├── test_vllm_logp.py               # vLLM 推理侧 logp 提取（vLLM prompt_logprobs）
 ├── compare_train_rollout_logp.py   # 离线 logp 比对分析
 ├── compare_activations.py          # 逐层激活比对分析
 ├── check_weights.py                # 权重一致性检查
